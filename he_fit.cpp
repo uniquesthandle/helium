@@ -1,6 +1,7 @@
 // he_fit.cpp - подгонка аналитической модели (вариант B) под аттестованный эталон.
 //
-//   he_fit данные.csv [-o coef.txt] [--init coef.txt] [--dmax 4] [--ridge 1e-10]
+//   he_fit данные.csv|- [-o coef.txt] [--init coef.txt] [--dmax 4] [--ridge 1e-10]
+//          [--abinitio data/he4_abinitio_bich2007.csv] [--keep-dilute]
 //
 // Вход: CSV с заголовком; столбцы (регистр не важен, порядок любой):
 //   T [К], P [Па], rho [кг/м3] – обязательны;  mu [Па с], lambda [Вт/(м К)] – необязательны.
@@ -14,6 +15,13 @@
 //   2) полиномы ln mu0(T), ln lambda0(T) степени 3 по s = ln(T/300) и добавка плотностной поправки
 //      sum d_jk s^k r^j (j=1..3, k=0..2, r = rho/100) к поправке Энскога (последняя берется
 //      из подогнанного уравнения состояния).
+// Режим привязки к ab initio (--abinitio, Bich, Hellmann, Vogel 2007): B(T) (полином степени 5 по s) и
+// ln mu0(T), ln lambda0(T) (степени 3) подгоняются к таблице стандартных значений в диапазоне 50-3000 К.
+// Данные CSV можно заменить на '-', тогда выполняется только эта привязка (поправочные члены = 0).
+// Если CSV с плотным газом задан, флаг --keep-dilute не дает подгонке переноса менять mu0 и lambda0:
+// по плотным данным подгоняется только добавка D(s, rho). Рекомендуемая последовательность:
+//   he_fit - --abinitio data/he4_abinitio_bich2007.csv -o dilute.txt
+//   he_fit dense.csv --init dilute.txt --keep-dilute -o coef.txt
 // Выход: файл коэффициентов для AnalyticModel::load / he_calc --model analytic:файл / he_table_build --coef.
 // Утилита печатает ошибки модели относительно данных ДО и ПОСЛЕ подгонки; критерий принятия – по ним.
 #include <algorithm>
@@ -105,9 +113,56 @@ static void evaluate(const AnalyticModel& m, const std::vector<Row>& d, const ch
   std::printf("\n");
 }
 
+// Привязка B(T), mu0(T), lambda0(T) к ab initio-таблице (столбцы: T, B, C, eta[мкПа с], lambda[мВт/(м К)])
+static bool stage_abinitio(AnalyticModel& m, const std::string& file) {
+  FILE* f = std::fopen(file.c_str(), "r");
+  if (!f) { std::fprintf(stderr, "Ошибка: не удалось открыть %s\n", file.c_str()); return false; }
+  std::vector<double> T, B, eta, lam;
+  char line[512];
+  while (std::fgets(line, sizeof line, f)) {
+    double t, b, c, e, l;
+    if (line[0] == '#' || !(line[0] == '-' || (line[0] >= '0' && line[0] <= '9'))) continue;
+    if (std::sscanf(line, "%lf,%lf,%lf,%lf,%lf", &t, &b, &c, &e, &l) == 5 && t >= T_MIN && t <= T_MAX) {
+      T.push_back(t); B.push_back(b); eta.push_back(e * 1e-6); lam.push_back(l * 1e-3);
+    }
+  }
+  std::fclose(f);
+  const int n = (int)T.size();
+  if (n < 12) { std::fprintf(stderr, "Ошибка: в %s меньше 12 точек в диапазоне 50-3000 К\n", file.c_str()); return false; }
+  std::vector<double> AB((size_t)n * 6), yb(n, 1.0), AM((size_t)n * 4), ym(n), yl(n), cb, cm, cl;
+  for (int i = 0; i < n; ++i) {
+    const double s = std::log(T[i] / 300.0);
+    for (int k = 0; k < 6; ++k) AB[(size_t)i * 6 + k] = std::pow(s, k) / B[i];   // относительная ошибка B
+    for (int k = 0; k < 4; ++k) AM[(size_t)i * 4 + k] = std::pow(s, k);
+    ym[i] = std::log(eta[i]);
+    yl[i] = std::log(lam[i]);
+  }
+  if (!lsq(AB, yb, n, 6, 1e-12, cb) || !lsq(AM, ym, n, 4, 1e-12, cm) || !lsq(AM, yl, n, 4, 1e-12, cl)) {
+    std::fprintf(stderr, "Ошибка: вырожденная система привязки к ab initio\n");
+    return false;
+  }
+  for (int k = 0; k < 6; ++k) m.coef().Bc[k] = cb[k];
+  for (int k = 0; k < 4; ++k) { m.coef().mu0[k] = cm[k]; m.coef().lam0[k] = cl[k]; }
+  for (int k = 0; k < 9; ++k) m.coef().mud[k] = m.coef().lamd[k] = 0.0;
+  m.finalize();
+  double eb = 0, em = 0, el = 0;
+  for (int i = 0; i < n; ++i) {
+    const double s = std::log(T[i] / 300.0);
+    double vb = 0, vm = 0, vl = 0;
+    for (int k = 5; k >= 0; --k) vb = vb * s + cb[k];
+    for (int k = 3; k >= 0; --k) { vm = vm * s + cm[k]; vl = vl * s + cl[k]; }
+    eb = std::fmax(eb, std::fabs(vb / B[i] - 1));
+    em = std::fmax(em, std::fabs(std::exp(vm) / eta[i] - 1));
+    el = std::fmax(el, std::fabs(std::exp(vl) / lam[i] - 1));
+  }
+  std::printf("Привязка к ab initio (%d точек, 50-3000 К): макс. ошибка полиномов  B %.3f %%, mu0 %.3f %%, lambda0 %.3f %%\n", n, eb * 100, em * 100, el * 100);
+  return true;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) { std::fprintf(stderr, "Использование: %s данные.csv [-o coef.txt] [--init coef.txt] [--dmax 4] [--ridge 1e-10]\n", argv[0]); return 1; }
-  std::string in = argv[1], out = "he_eos_coef.txt", init;
+  std::string in = argv[1], out = "he_eos_coef.txt", init, abfile;
+  bool keepDilute = false;
   int dmax = 4;
   double ridge = 1e-10;
   for (int i = 2; i < argc; ++i) {
@@ -116,7 +171,20 @@ int main(int argc, char** argv) {
     else if (a == "--init" && i + 1 < argc) init = argv[++i];
     else if (a == "--dmax" && i + 1 < argc) dmax = std::atoi(argv[++i]);
     else if (a == "--ridge" && i + 1 < argc) ridge = std::atof(argv[++i]);
+    else if (a == "--abinitio" && i + 1 < argc) abfile = argv[++i];
+    else if (a == "--keep-dilute") keepDilute = true;
     else { std::fprintf(stderr, "неизвестный параметр %s\n", a.c_str()); return 1; }
+  }
+  if (in == "-") {
+    if (abfile.empty()) { std::fprintf(stderr, "Ошибка: вместо CSV '-' требуется --abinitio\n"); return 1; }
+    AnalyticModel m0;
+    std::string e0;
+    if (!init.empty() && !m0.load(init.c_str(), &e0)) { std::fprintf(stderr, "Ошибка: %s\n", e0.c_str()); return 2; }
+    m0.coef().ncorr = 0;
+    if (!stage_abinitio(m0, abfile)) return 2;
+    if (!m0.save(out.c_str())) { std::fprintf(stderr, "Ошибка: не удалось записать %s\n", out.c_str()); return 3; }
+    std::printf("Коэффициенты записаны: %s\nПроверьте: he_check_abinitio data/he4_abinitio_bich2007.csv --model analytic:%s\n", out.c_str(), out.c_str());
+    return 0;
   }
   FILE* f = std::fopen(in.c_str(), "r");
   if (!f) { std::fprintf(stderr, "Ошибка: не удалось открыть %s\n", in.c_str()); return 2; }
@@ -146,6 +214,7 @@ int main(int argc, char** argv) {
   std::string err;
   if (!init.empty() && !m.load(init.c_str(), &err)) { std::fprintf(stderr, "Ошибка: %s\n", err.c_str()); return 2; }
   m.coef().ncorr = 0;
+  if (!abfile.empty() && !stage_abinitio(m, abfile)) return 2;
   std::printf("Прочитано %zu точек. Ошибки модели относительно данных:\n", d.size());
   evaluate(m, d, "до:");
 
@@ -172,7 +241,7 @@ int main(int argc, char** argv) {
   for (int which = 0; which < 2; ++which) {
     std::vector<int> ids;
     for (int k = 0; k < mrows; ++k) if ((which == 0 ? d[k].mu : d[k].lam) > 0) ids.push_back(k);
-    const int nc = 13;
+    const int nc = keepDilute ? 9 : 13, off = keepDilute ? 0 : 4;
     if ((int)ids.size() < 3 * nc) continue;
     std::vector<double> B(ids.size() * nc), yy(ids.size()), c;
     for (size_t q = 0; q < ids.size(); ++q) {
@@ -181,14 +250,19 @@ int main(int argc, char** argv) {
       m.enskog(r.T, r.rho, fm, fl);
       const double s = std::log(r.T / 300.0), rr = r.rho / 100.0;
       yy[q] = std::log(which == 0 ? r.mu : r.lam) - std::log(which == 0 ? fm : fl);
-      for (int k = 0; k < 4; ++k) B[q * nc + k] = std::pow(s, k);
-      for (int j = 0; j < 3; ++j) for (int k = 0; k < 3; ++k) B[q * nc + 4 + 3 * j + k] = std::pow(rr, j + 1) * std::pow(s, k);
+      if (keepDilute) {
+        const double* p0k = which == 0 ? m.coef().mu0 : m.coef().lam0;
+        yy[q] -= p0k[0] + s * (p0k[1] + s * (p0k[2] + s * p0k[3]));
+      } else {
+        for (int k = 0; k < 4; ++k) B[q * nc + k] = std::pow(s, k);
+      }
+      for (int j = 0; j < 3; ++j) for (int k = 0; k < 3; ++k) B[q * nc + off + 3 * j + k] = std::pow(rr, j + 1) * std::pow(s, k);
     }
     if (!lsq(B, yy, (int)ids.size(), nc, ridge, c)) continue;
     double* p0 = which == 0 ? m.coef().mu0 : m.coef().lam0;
     double* pd = which == 0 ? m.coef().mud : m.coef().lamd;
-    for (int k = 0; k < 4; ++k) p0[k] = c[k];
-    for (int k = 0; k < 9; ++k) pd[k] = c[4 + k];
+    if (!keepDilute) for (int k = 0; k < 4; ++k) p0[k] = c[k];
+    for (int k = 0; k < 9; ++k) pd[k] = c[off + k];
   }
   std::printf("Ошибки модели после подгонки (%d поправочных членов):\n", nt);
   evaluate(m, d, "после:");

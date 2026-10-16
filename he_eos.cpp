@@ -110,7 +110,7 @@ void AnalyticModel::helm(const Prep& p, double rho, int lvl, Hd& d) const {
 
 int AnalyticModel::solve_rho(const Prep& p, double T, double P, double& rho) const {
   const double RT = R_SPEC * T;
-  double lo = 0.0, hi = 0.999 * 4.0 / p.b;
+  double lo = 0.0, hi = p.b > 0 ? 0.999 * 4.0 / p.b : 1.0e4;  // b <= 0 (T < ~24 K): верхняя граница по плотности – условная
   rho = P / RT;
   if (rho >= hi) rho = 0.5 * hi;
   Hd d;

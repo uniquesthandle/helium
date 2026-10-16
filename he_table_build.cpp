@@ -254,6 +254,7 @@ int main(int argc, char** argv) {
   std::vector<LeafRec> leaves;
   int unresolved = 0;
   double worst_leaf = 0;
+  size_t done = 0;
   while (!work.empty()) {
     const LeafId id = work.back();
     work.pop_back();
@@ -268,7 +269,13 @@ int main(int argc, char** argv) {
       worst_leaf = std::fmax(worst_leaf, e);
       leaves.push_back(rec);
     }
+    if (++done % 200 == 0) {
+      std::printf("  обработано ячеек: %zu, в очереди: %zu, листьев: %zu\r", 
+                  done, work.size(), leaves.size());
+      std::fflush(stdout);
+    }    
   }
+  std::printf("\n");
   TableHeader h;
   std::memset(&h, 0, sizeof h);
   std::memcpy(h.magic, "HE4TBL02", 8);
