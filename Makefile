@@ -28,6 +28,9 @@ he_fit: he_fit.cpp he_eos.cpp he_api.cpp he_eos.h he_api.h
 he_check_abinitio: he_check_abinitio.cpp $(CORE) he_api.h he_eos.h he_table.h
 	$(CXX) $(CXXFLAGS) he_check_abinitio.cpp $(CORE) -o $@
 
+he_gas_test: he_gas_test.cpp he_gas.cpp he_api.cpp he_table.cpp he_eos.cpp he_console.h
+	$(CXX) $(CXXFLAGS) -pthread -o $@ $^
+
 # проверка по ab initio-значениям (Bich, Hellmann, Vogel 2007): встроенные коэффициенты (ожидаемо не проходят),
 # затем привязка к ab initio и повторная проверка
 check-abinitio: he_check_abinitio he_fit
